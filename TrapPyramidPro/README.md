@@ -33,7 +33,8 @@ v1.50 sonucuyla karşılaştırın; böylece düzeltmelerin etkisini ayrı gör�
 Modelleme: **Gerçek tiklere dayalı her tik**, gecikme: rastgele (veya ≥ 50 ms). En az 6–12 ay; tek bir ay üzerinde optimizasyon yapmayın.
 
 1. **Temel çizgi**: v1.60 varsayılan ayarlar ve aynı dönem. v1.50 ile karşılaştırın.
-2. **Ayna testi** (kaybın kaynağını ayırır): `InpEnablePyramid = false`, `InpMaxDailyLossPct = 0`
+2. **Ayna testi** (kaybın kaynağını ayırır). A ve B'nin gerçekten birbirinin tersi olması için şunları sabit tutun:
+   `InpEnablePyramid = false`, `InpMaxDailyLossPct = 0`, `InpUseADX = false`, `InpRiskPercent = 0`, `InpCommissionPerLot = 0`
    - A: Mod = Stop tuzak, SL = 1.0, TP = 1.8
    - B: Mod = Limit fade, SL = 1.8, TP = 1.0 (A ile aynı noktadan giren, SL/TP'si yer değiştirmiş ters işlem)
    - Yön etkisi ≈ (A − B) / 2, maliyet ≈ −(A + B) / 2. B kârlıysa kayıp, kırılımların geri dönmesinden (ortalamaya dönüş) geliyor.

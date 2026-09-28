@@ -26,9 +26,15 @@
 //|  YENİ      ADX rejim filtresi, ATR/spread filtresi, günlük en     |
 //|            fazla işlem grubu sayısı.                              |
 //|  DEĞİŞTİ   Günlük zarar limiti bakiyenin %'si (2.5% = 1000$'da 25$)|
+//|  DEĞİŞTİ   Küçükler: InpMaxSpreadPoints = 0 -> spread filtresi    |
+//|            kapalı; trend verisi okunamazsa emir kurulmaz; OCO'da  |
+//|            tüm bekleyen emirler silinir; SL/TP/trailing mesafesi  |
+//|            en az broker stop seviyesi; hatalı InpSession -> init  |
+//|            hatası.                                                |
 //|                                                                   |
-//| Ayna testi (kaybın kaynağını ayırmak için; Pyramid = false,       |
-//| InpMaxDailyLossPct = 0, aynı tarih aralığı ve modelleme):         |
+//| Ayna testi (kaybın kaynağını ayırmak için). Sabit tutun:          |
+//|   Pyramid = false, InpMaxDailyLossPct = 0, InpUseADX = false,     |
+//|   InpRiskPercent = 0, InpCommissionPerLot = 0, aynı dönem/model.  |
 //|   A) Mod = Stop tuzak, SL = 1.0, TP = 1.8                         |
 //|   B) Mod = Limit fade, SL = 1.8, TP = 1.0  (A'nın ters işlemi)    |
 //|   Brüt yön etkisi ~ (A - B) / 2, maliyet (spread+kom.) ~ -(A + B)/2|
@@ -115,7 +121,7 @@ input double   InpMinCandleATR     = 0.2;
 //--- global
 int      atrHandle = INVALID_HANDLE, emaHandle = INVALID_HANDLE, adxHandle = INVALID_HANDLE;
 datetime lastBarTime = 0, cooldownUntil = 0, trapPlacedTime = 0;
-double   dailyStartBalance = 0, trapRefPrice = 0;
+double   dailyStartBalance = 0, trapRefPrice = 0, groupRisk = 0;
 int      lastDay = -1, groupsToday = 0, sessStart = 0, sessEnd = 0;
 bool     dailyStop = false, inGroup = false;
 int      cntSession=0, cntSpread=0, cntCandle=0, cntDaily=0, cntPlaced=0, cntCooldown=0,
@@ -217,7 +223,12 @@ void OnTick()
    //--- Açık pozisyon yönetimi: seans/spread'den bağımsız, her tick
    if(totalPos > 0)
    {
-      if(!inGroup) { inGroup = true; groupsToday++; cntGroups++; }
+      if(!inGroup)
+      {
+         inGroup   = true;
+         groupRisk = CurrentGroupRisk(atr);               // pyramid risk tavanı için 1R
+         groupsToday++; cntGroups++;
+      }
       if(CountPending() > 0) DeleteAllPending();          // OCO: karşı emri iptal et
 
       if(InpEnablePyramid && totalPos < CalculateDynamicMaxPyramid())
@@ -234,12 +245,17 @@ void OnTick()
       cooldownUntil = barTime + cd * PeriodSeconds(PERIOD_CURRENT);
    }
 
-   //--- Bekleyen emir varken spread açılırsa emirleri çek (her tick)
+   //--- Bekleyen emir: spread açıldıysa veya ömrü dolduysa çek (her tick)
    long spreadPts = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   if(InpMaxSpreadPoints > 0 && spreadPts > InpMaxSpreadPoints && CountPending() > 0)
+   if(CountPending() > 0)
    {
-      DeleteAllPending();
-      cntSpreadDel++;
+      bool wideSpread = InpMaxSpreadPoints > 0 && spreadPts > InpMaxSpreadPoints;
+      bool expired    = TimeCurrent() - trapPlacedTime >= (long)InpPendingBars * PeriodSeconds(PERIOD_CURRENT);
+      if(wideSpread || expired)
+      {
+         DeleteAllPending();
+         if(wideSpread) cntSpreadDel++;
+      }
    }
 
    //--- Buradan sonrası: yeni işlem/emir mantığı, sadece yeni barda
@@ -265,7 +281,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-// Kalıcı giriş emirleri: süre dolunca / fiyat uzaklaşınca yenile.
+// Kalıcı giriş emirleri: fiyat uzaklaşınca yenile (süre dolumu OnTick'te, her tick).
 // Kanal modunda seviyeler bar bar değiştiği için her yeni barda yeniden kurulur.
 void ManageEntryOrders(double atr, double ask, double bid)
 {
@@ -273,11 +289,10 @@ void ManageEntryOrders(double atr, double ask, double bid)
 
    if(CountPending() > 0)
    {
-      long life    = (long)InpPendingBars * PeriodSeconds(PERIOD_CURRENT);
-      bool expired = (TimeCurrent() - trapPlacedTime) >= life;
       bool drifted = InpRefreshATR > 0 && MathAbs(mid - trapRefPrice) > atr * InpRefreshATR;
-      if(InpEntryMode != ENTRY_RANGE_BREAK && !expired && !drifted) return;   // emirler yaşasın
+      if(InpEntryMode != ENTRY_RANGE_BREAK && !drifted) return;   // emirler yaşasın
       DeleteAllPending();
+      if(CountPending() > 0) return;                               // silinemedi: çift emir kurma
    }
 
    double spread   = ask - bid;
@@ -325,8 +340,8 @@ void ManageEntryOrders(double atr, double ask, double bid)
    }
 
    ENUM_ORDER_TYPE_TIME tt = ORDER_TIME_GTC;
-   datetime exp = 0;
-   GetExpiry(tt, exp);
+   datetime expiry = 0;
+   GetExpiry(tt, expiry);
 
    bool placed = false;
    if(allowBuy)
@@ -334,8 +349,8 @@ void ManageEntryOrders(double atr, double ask, double bid)
       double p  = NormalizePrice(buyPx);
       double sl = NormalizePrice(p - slDist);
       double tp = tpDist > 0 ? NormalizePrice(p + tpDist) : 0;
-      bool ok = useStop ? trade.BuyStop(lot, p, _Symbol, sl, tp, tt, exp, "Trap BuyStop")
-                        : trade.BuyLimit(lot, p, _Symbol, sl, tp, tt, exp, "Fade BuyLimit");
+      bool ok = useStop ? trade.BuyStop(lot, p, _Symbol, sl, tp, tt, expiry, "Trap BuyStop")
+                        : trade.BuyLimit(lot, p, _Symbol, sl, tp, tt, expiry, "Fade BuyLimit");
       if(ok) { cntPlaced++; placed = true; }
    }
    if(allowSell)
@@ -343,8 +358,8 @@ void ManageEntryOrders(double atr, double ask, double bid)
       double p  = NormalizePrice(sellPx);
       double sl = NormalizePrice(p + slDist);
       double tp = tpDist > 0 ? NormalizePrice(p - tpDist) : 0;
-      bool ok = useStop ? trade.SellStop(lot, p, _Symbol, sl, tp, tt, exp, "Trap SellStop")
-                        : trade.SellLimit(lot, p, _Symbol, sl, tp, tt, exp, "Fade SellLimit");
+      bool ok = useStop ? trade.SellStop(lot, p, _Symbol, sl, tp, tt, expiry, "Trap SellStop")
+                        : trade.SellLimit(lot, p, _Symbol, sl, tp, tt, expiry, "Fade SellLimit");
       if(ok) { cntPlaced++; placed = true; }
    }
    if(placed)
@@ -356,18 +371,18 @@ void ManageEntryOrders(double atr, double ask, double bid)
 
 //+------------------------------------------------------------------+
 // Broker süreli emre izin veriyorsa kullan, vermiyorsa GTC (süreyi EA yönetir)
-void GetExpiry(ENUM_ORDER_TYPE_TIME &tt, datetime &exp)
+void GetExpiry(ENUM_ORDER_TYPE_TIME &tt, datetime &expiry)
 {
    long modes = SymbolInfoInteger(_Symbol, SYMBOL_EXPIRATION_MODE);
    if((modes & SYMBOL_EXPIRATION_SPECIFIED) == SYMBOL_EXPIRATION_SPECIFIED)
    {
-      tt  = ORDER_TIME_SPECIFIED;
-      exp = TimeCurrent() + InpPendingBars * PeriodSeconds(PERIOD_CURRENT);
+      tt     = ORDER_TIME_SPECIFIED;
+      expiry = TimeCurrent() + InpPendingBars * PeriodSeconds(PERIOD_CURRENT);
    }
    else
    {
-      tt  = ORDER_TIME_GTC;
-      exp = 0;
+      tt     = ORDER_TIME_GTC;
+      expiry = 0;
    }
 }
 
@@ -457,10 +472,10 @@ bool IsInSession()
 void ManagePyramid(int totalBuy, int totalSell, double ask, double bid, double atr)
 {
    double step    = atr * InpPyramidStepATR;
-   double slDist  = CalculateSLDistance(atr);
+   double stopLvl = StopLevelPrice();
+   double slDist  = MathMax(CalculateSLDistance(atr), stopLvl + _Point);
    double tpDist  = InpTPATRMult > 0 ? atr * InpTPATRMult : 0;
    double baseLot = CalculateLot(slDist);
-   double stopLvl = StopLevelPrice();
 
    if(totalBuy > 0 && (!InpOnlyOneDirection || totalSell == 0))
    {
@@ -470,7 +485,7 @@ void ManagePyramid(int totalBuy, int totalSell, double ask, double bid, double a
          double lot = NormalizeLot(baseLot * MathPow(InpPyramidLotMult, totalBuy));
          double sl  = ask - slDist;
          if(InpPyramidBE)
-            sl = MathMin(GroupStopLevel(POSITION_TYPE_BUY, lot, ask, slDist, baseLot), bid - stopLvl - _Point);
+            sl = MathMin(GroupStopLevel(POSITION_TYPE_BUY, lot, ask), bid - stopLvl - _Point);
          sl = NormalizePrice(sl);
          double tp = tpDist > 0 ? NormalizePrice(ask + tpDist) : 0;
          if(trade.Buy(lot, _Symbol, ask, sl, tp, "Pyramid Buy"))
@@ -489,7 +504,7 @@ void ManagePyramid(int totalBuy, int totalSell, double ask, double bid, double a
          double lot = NormalizeLot(baseLot * MathPow(InpPyramidLotMult, totalSell));
          double sl  = bid + slDist;
          if(InpPyramidBE)
-            sl = MathMax(GroupStopLevel(POSITION_TYPE_SELL, lot, bid, slDist, baseLot), ask + stopLvl + _Point);
+            sl = MathMax(GroupStopLevel(POSITION_TYPE_SELL, lot, bid), ask + stopLvl + _Point);
          sl = NormalizePrice(sl);
          double tp = tpDist > 0 ? NormalizePrice(bid - tpDist) : 0;
          if(trade.Sell(lot, _Symbol, bid, sl, tp, "Pyramid Sell"))
@@ -502,8 +517,8 @@ void ManagePyramid(int totalBuy, int totalSell, double ask, double bid, double a
 }
 
 // Eklenecek pozisyon dahil grubun ortak SL seviyesi: bu seviyede grubun toplam zararı
-// en fazla InpPyramidRiskR x (baz lot x slDist) olur. 0 -> komisyon dahil başabaş.
-double GroupStopLevel(ENUM_POSITION_TYPE type, double addLot, double addPrice, double slDist, double baseLot)
+// (komisyon dahil) en fazla InpPyramidRiskR x groupRisk olur. 0 -> gerçek başabaş.
+double GroupStopLevel(ENUM_POSITION_TYPE type, double addLot, double addPrice)
 {
    double lots = 0, lotPx = 0;
    GroupSums(type, lots, lotPx);
@@ -512,10 +527,31 @@ double GroupStopLevel(ENUM_POSITION_TYPE type, double addLot, double addPrice, d
    if(lots <= 0) return 0;
 
    double avg     = lotPx / lots;
-   double allowed = MathMax(InpPyramidRiskR, 0.0) * slDist * baseLot / lots;
+   double allowed = MathMax(InpPyramidRiskR, 0.0) * groupRisk / lots;
    double comm    = CommissionInPrice();
    if(type == POSITION_TYPE_BUY) return avg - allowed + comm;
    return avg + allowed - comm;
+}
+
+// Grup açıldığı andaki risk (fiyat x lot): pozisyonların SL'ye kadar zararı = 1R.
+// SL yoksa veya zaten kâr bölgesindeyse (EA yeniden başlatıldıysa) ATR'ye göre tahmin.
+double CurrentGroupRisk(double atr)
+{
+   double risk = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl   = PositionGetDouble(POSITION_SL);
+      double dist = 0;
+      if(sl > 0) dist = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? open - sl : sl - open;
+      if(dist <= 0) dist = CalculateSLDistance(atr);
+      risk += dist * PositionGetDouble(POSITION_VOLUME);
+   }
+   return risk;
 }
 
 //+------------------------------------------------------------------+
