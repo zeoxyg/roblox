@@ -15,12 +15,13 @@ hierarchy (names, classes, attributes, tags) and the full source of every
 
 1. Open your place in Studio (edit mode, not playtest).
 2. Click **Dump Game** on the **Game Dump** toolbar.
-3. Click inside the "Game Dump" window, press **Ctrl+A** then **Ctrl+C**.
-4. Paste it into a `.txt` file, or paste it into the chat.
+3. In the "Game Dump" window, click inside each part, press **Ctrl+A** then
+   **Ctrl+C**, and paste it into one `.txt` file in part order.
+4. Attach that `.txt` file, or paste it into the chat.
 
 Studio plugins cannot write files to disk, so the dump is shown in a window
-for copying. For large games the text can be very long; in that case, save
-it to a `.txt` file and attach that instead of pasting.
+for copying. Each TextBox in Studio holds at most 200,000 characters, so large
+games are split into several "Part N of M" sections.
 
 ## Notes
 
